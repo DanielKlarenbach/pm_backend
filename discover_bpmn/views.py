@@ -2,29 +2,89 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 import pygraphviz as pgv
 import itertools
-from itertools import product
 from collections import defaultdict
 from typing import Dict, Set
 import pandas as pd
-from functools import reduce
-from itertools import groupby
 from itertools import chain
 from more_itertools import pairwise
 from collections import Counter
+from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.decorators import parser_classes
+import os
+import pm4py
+from pm4py.visualization.bpmn import visualizer as pn_visualizer
+from pm4py.objects.conversion.log import converter as xes_converter
+from pm4py.objects.log.importer.xes import importer as xes_importer
 
-
-@api_view()
+@api_view(['POST'])
+@parser_classes([FormParser, MultiPartParser])
 def discover_model(request):
-    traces = csv_file_to_traces('./discover_bpmn/A1.csv')
-    graph = alpha_draw_model(traces)
+    file_extension = get_file_extension(request.data['file'].name)
+
+    if request.data['algorithm'] == 'own':
+        if file_extension == '.csv':
+            traces = csv_file_to_traces(
+                request.data['file'],
+                id_column_name=request.data['id'],
+                activity_column_name=request.data['activity'],
+                timestamp_column_name=request.data['timestamp']
+            )
+        elif file_extension == '.xes':
+            traces = xes_file_to_traces(request.data['file'])
+        print(traces)
+        graph = alpha_draw_model(traces)
+
+    elif request.data['algorithm'] == 'pm4py':
+        if file_extension == '.csv':
+            dataframe = pd.read_csv(request.data['file'])
+            dataframe = pm4py.format_dataframe(
+                dataframe,
+                case_id='Case ID',
+                activity_key='Activity',
+                timestamp_key='Start Timestamp'
+            )
+            event_log = pm4py.convert_to_event_log(dataframe)
+        elif file_extension == '.xes':
+            file = request.data['file']
+            with open('pm.xes', 'wb+') as destination:
+                for chunk in file.chunks():
+                    destination.write(chunk)
+
+            event_log = pm4py.read_xes("pm.xes")
+            os.remove("pm.xes")
+            print(event_log)
+
+        net = pm4py.discover_bpmn_inductive(event_log)
+        graph = pn_visualizer.apply(net).source
 
     return Response({"graph": graph})
 
+def get_file_extension(filename):
+    return os.path.splitext(filename)[1]
 
-def csv_file_to_traces(filename):
-    log = (pd.read_csv(filename)
-           .sort_values(by=['Case ID', 'Start Timestamp'])
-           .groupby(['Case ID'])
+def csv_file_to_traces(file, id_column_name, activity_column_name, timestamp_column_name):
+    log = (pd.read_csv(file)
+           .sort_values(by=[id_column_name, timestamp_column_name])
+           .groupby([id_column_name])
+           .agg({activity_column_name: lambda x: tuple(x)}))
+
+    traces = []
+    for log_entry in log[activity_column_name]:
+        traces.append(log_entry)
+
+    return traces
+
+def xes_file_to_traces(file):
+    with open('pm.xes', 'wb+') as destination:
+        for chunk in file.chunks():
+            destination.write(chunk)
+
+    event_log = pm4py.read_xes("pm.xes")
+    os.remove("pm.xes")
+
+    log = (event_log
+           .sort_values(by=['case:concept:name', 'time:timestamp'])
+           .groupby(['case:concept:name'])
            .agg({'Activity': lambda x: tuple(x)}))
 
     traces = []
